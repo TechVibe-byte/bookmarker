@@ -1,6 +1,25 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Search, Plus, Moon, Sun, BookMarked, LayoutGrid, ArrowUpDown, ChevronDown, Settings, Download, Upload, Trash2, X, AlertTriangle, WifiOff, Smartphone } from 'lucide-react';
+import { 
+  DndContext, 
+  closestCenter, 
+  KeyboardSensor, 
+  PointerSensor, 
+  useSensor, 
+  useSensors,
+  DragOverlay,
+  DragEndEvent,
+  DragStartEvent,
+  TouchSensor
+} from '@dnd-kit/core';
+import { 
+  arrayMove, 
+  SortableContext, 
+  sortableKeyboardCoordinates, 
+  rectSortingStrategy 
+} from '@dnd-kit/sortable';
+
 import { Bookmark, CategoryType, Theme } from './types';
 import { useLocalStorage } from './hooks/useLocalStorage';
 import CategoryTabs from './components/CategoryTabs';
@@ -17,7 +36,7 @@ const CATEGORIES: CategoryType[] = [
   'Shopping'
 ];
 
-type SortOption = 'newest' | 'oldest' | 'a-z' | 'z-a' | 'domain';
+type SortOption = 'newest' | 'oldest' | 'a-z' | 'z-a' | 'domain' | 'custom';
 
 // Interface for the BeforeInstallPromptEvent
 interface BeforeInstallPromptEvent extends Event {
@@ -35,6 +54,9 @@ function App() {
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [editingBookmark, setEditingBookmark] = useState<Bookmark | null>(null);
   
+  // DnD State
+  const [activeId, setActiveId] = useState<string | null>(null);
+  
   // Delete confirmation state
   const [itemToDelete, setItemToDelete] = useState<string | null>(null);
   
@@ -44,15 +66,32 @@ function App() {
   
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  // DnD Sensors
+  const sensors = useSensors(
+    useSensor(PointerSensor, {
+      activationConstraint: {
+        distance: 5, // Prevent drag on simple clicks
+      },
+    }),
+    useSensor(TouchSensor, {
+        // Press delay for touch to avoid conflict with scroll, 
+        // though we use a handle, this adds safety.
+        activationConstraint: {
+            delay: 150,
+            tolerance: 5,
+        }
+    }),
+    useSensor(KeyboardSensor, {
+      coordinateGetter: sortableKeyboardCoordinates,
+    })
+  );
+
   // Splash Screen Logic
   useEffect(() => {
     const splash = document.getElementById('splash-screen');
     if (splash) {
-      // Wait 2 seconds for the branding to be seen
       setTimeout(() => {
-        // Start CSS fade transition
         splash.style.opacity = '0';
-        // Remove from DOM after transition (0.5s matched with CSS)
         setTimeout(() => {
           splash.remove();
         }, 500);
@@ -77,9 +116,7 @@ function App() {
   // PWA Install Prompt Listener
   useEffect(() => {
     const handleBeforeInstallPrompt = (e: Event) => {
-      // Prevent the mini-infobar from appearing on mobile
       e.preventDefault();
-      // Stash the event so it can be triggered later.
       setInstallPrompt(e as BeforeInstallPromptEvent);
     };
 
@@ -92,13 +129,8 @@ function App() {
 
   const handleInstallClick = async () => {
     if (!installPrompt) return;
-    
-    // Show the install prompt
     await installPrompt.prompt();
-    
-    // Wait for the user to respond to the prompt
     const { outcome } = await installPrompt.userChoice;
-    
     if (outcome === 'accepted') {
       setInstallPrompt(null);
     }
@@ -161,7 +193,6 @@ function App() {
     }
   };
 
-  // --- Export / Import Logic ---
   const handleExportData = () => {
     const dataStr = JSON.stringify(bookmarks, null, 2);
     const dataUri = 'data:application/json;charset=utf-8,'+ encodeURIComponent(dataStr);
@@ -186,12 +217,9 @@ function App() {
           try {
             const parsed = JSON.parse(e.target.result as string);
             if (Array.isArray(parsed)) {
-              // Basic validation to ensure it looks like our data
               const isValid = parsed.every(b => b.id && b.url && typeof b.createdAt === 'number');
-              
               if (isValid) {
                 if (confirm(`Found ${parsed.length} bookmarks. This will merge them with your current ${bookmarks.length} bookmarks. Continue?`)) {
-                   // Merge Logic: Deduplicate by ID
                    const currentIds = new Set(bookmarks.map(b => b.id));
                    const newBookmarks = parsed.filter(b => !currentIds.has(b.id));
                    const updatedBookmarks = [...bookmarks, ...newBookmarks];
@@ -212,7 +240,6 @@ function App() {
         }
       };
     }
-    // Reset input so same file can be selected again if needed
     if (event.target) event.target.value = '';
   };
 
@@ -223,6 +250,8 @@ function App() {
     }
   };
 
+  // --- Filtering & Sorting Logic ---
+  
   const filteredBookmarks = bookmarks
     .filter(bookmark => {
       const matchesCategory = selectedCategory === 'All Bookmarks' || bookmark.category === selectedCategory;
@@ -233,20 +262,43 @@ function App() {
     })
     .sort((a, b) => {
       switch (sortOption) {
-        case 'newest':
-          return b.createdAt - a.createdAt;
-        case 'oldest':
-          return a.createdAt - b.createdAt;
-        case 'a-z':
-          return a.title.localeCompare(b.title);
-        case 'z-a':
-          return b.title.localeCompare(a.title);
-        case 'domain':
-          return a.domain.localeCompare(b.domain);
-        default:
-          return 0;
+        case 'newest': return b.createdAt - a.createdAt;
+        case 'oldest': return a.createdAt - b.createdAt;
+        case 'a-z': return a.title.localeCompare(b.title);
+        case 'z-a': return b.title.localeCompare(a.title);
+        case 'domain': return a.domain.localeCompare(b.domain);
+        case 'custom': return 0; // Respect array order
+        default: return 0;
       }
     });
+
+  // --- Drag and Drop Logic ---
+
+  const handleDragStart = (event: DragStartEvent) => {
+    setActiveId(event.active.id as string);
+  };
+
+  const handleDragEnd = (event: DragEndEvent) => {
+    const { active, over } = event;
+    setActiveId(null);
+
+    if (!over || active.id === over.id) return;
+
+    // Automatically switch to custom sort if user rearranges
+    if (sortOption !== 'custom') {
+      setSortOption('custom');
+    }
+
+    setBookmarks((items) => {
+      const oldIndex = items.findIndex((i) => i.id === active.id);
+      const newIndex = items.findIndex((i) => i.id === over.id);
+      
+      // We use the global index to reorder the main state
+      return arrayMove(items, oldIndex, newIndex);
+    });
+  };
+
+  const activeBookmark = activeId ? bookmarks.find(b => b.id === activeId) : null;
 
   return (
     <div className={`min-h-screen text-gray-800 dark:text-gray-100 overflow-x-hidden selection:bg-indigo-500 selection:text-white`}>
@@ -279,7 +331,6 @@ function App() {
         
         {/* Header */}
         <header className="flex flex-col gap-3 sm:gap-6 mb-4 sm:mb-8">
-          {/* Top Row: Brand & Settings */}
           <div className="flex items-center justify-between">
             <div className="flex items-center space-x-3">
               <div className="p-3 bg-gradient-to-br from-indigo-500 to-purple-600 rounded-2xl shadow-lg shadow-indigo-500/30">
@@ -291,7 +342,6 @@ function App() {
             </div>
 
             <div className="flex items-center gap-2">
-              {/* Desktop Theme Toggle */}
               <button
                 onClick={toggleTheme}
                 className="hidden md:flex p-3 rounded-2xl bg-white/50 dark:bg-white/5 backdrop-blur-md border border-gray-200/50 dark:border-white/10 hover:bg-white/80 dark:hover:bg-white/10 transition-all shadow-sm items-center justify-center"
@@ -299,7 +349,6 @@ function App() {
                 {theme === 'dark' ? <Sun className="w-5 h-5 text-yellow-400" /> : <Moon className="w-5 h-5 text-indigo-600" />}
               </button>
 
-              {/* Settings Button */}
               <button
                 onClick={() => setIsSettingsOpen(true)}
                 className="p-3 rounded-2xl bg-white/50 dark:bg-white/5 backdrop-blur-md border border-gray-200/50 dark:border-white/10 hover:bg-white/80 dark:hover:bg-white/10 transition-all shadow-sm"
@@ -309,11 +358,8 @@ function App() {
             </div>
           </div>
 
-          {/* Controls Row */}
           <div className="flex flex-col sm:flex-row md:items-center gap-2 sm:gap-3 w-full justify-between">
-             {/* Search and Sort Group */}
              <div className="flex items-center gap-2 sm:gap-3 w-full md:w-auto flex-1">
-                {/* Sort Dropdown */}
                 <div className="relative group min-w-[130px] sm:min-w-[160px]">
                   <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
                     <ArrowUpDown className="h-4 w-4 text-gray-400 group-focus-within:text-indigo-500 transition-colors" />
@@ -334,6 +380,7 @@ function App() {
                       truncate
                     "
                   >
+                    <option value="custom" className="bg-white dark:bg-gray-900">Custom Order</option>
                     <option value="newest" className="bg-white dark:bg-gray-900">Newest</option>
                     <option value="oldest" className="bg-white dark:bg-gray-900">Oldest</option>
                     <option value="a-z" className="bg-white dark:bg-gray-900">A-Z</option>
@@ -345,7 +392,6 @@ function App() {
                   </div>
                 </div>
 
-                {/* Search Bar */}
                 <div className="relative flex-grow group">
                   <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
                     <Search className="h-5 w-5 text-gray-400 group-focus-within:text-indigo-500 transition-colors" />
@@ -372,7 +418,6 @@ function App() {
           </div>
         </header>
 
-        {/* Navigation & Actions */}
         <div className="sticky top-4 z-30 mb-4 sm:mb-8 space-y-4">
           <div className="flex items-center justify-between backdrop-blur-xl bg-white/30 dark:bg-black/30 p-2 rounded-[20px] border border-white/20 dark:border-white/5 shadow-lg">
             <div className="flex-grow overflow-hidden">
@@ -401,7 +446,6 @@ function App() {
           </div>
         </div>
 
-        {/* Mobile Floating Action Button */}
         <motion.button
           initial={{ scale: 0 }}
           animate={{ scale: 1 }}
@@ -411,7 +455,7 @@ function App() {
           <Plus size={24} />
         </motion.button>
 
-        {/* Bookmarks Grid */}
+        {/* Bookmarks Grid with DnD */}
         <div className="min-h-[50vh] pb-24 sm:pb-8">
           {bookmarks.length === 0 ? (
             <div className="flex flex-col items-center justify-center h-64 text-center">
@@ -438,24 +482,49 @@ function App() {
               </p>
             </div>
           ) : (
-            <motion.div 
-              layout
-              className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4 sm:gap-6"
+            <DndContext
+              sensors={sensors}
+              collisionDetection={closestCenter}
+              onDragStart={handleDragStart}
+              onDragEnd={handleDragEnd}
             >
-              <AnimatePresence>
-                {filteredBookmarks.map((bookmark) => (
-                  <BookmarkCard 
-                    key={bookmark.id} 
-                    bookmark={bookmark} 
-                    onDelete={handleDeleteClick} 
-                    onEdit={openEditModal}
-                  />
-                ))}
-              </AnimatePresence>
-            </motion.div>
+              <SortableContext 
+                items={filteredBookmarks.map(b => b.id)}
+                strategy={rectSortingStrategy}
+              >
+                <motion.div 
+                  layout={!activeId} // Disable framer-motion layout during drag to prevent conflict
+                  className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4 sm:gap-6"
+                >
+                  <AnimatePresence>
+                    {filteredBookmarks.map((bookmark) => (
+                      <BookmarkCard 
+                        key={bookmark.id} 
+                        bookmark={bookmark} 
+                        onDelete={handleDeleteClick} 
+                        onEdit={openEditModal}
+                      />
+                    ))}
+                  </AnimatePresence>
+                </motion.div>
+              </SortableContext>
+
+              {/* Drag Overlay for smooth visuals */}
+              <DragOverlay adjustScale={true}>
+                {activeBookmark ? (
+                  <div className="opacity-90">
+                     <BookmarkCard
+                        bookmark={activeBookmark}
+                        onDelete={() => {}}
+                        onEdit={() => {}}
+                        isDragOverlay
+                      />
+                  </div>
+                ) : null}
+              </DragOverlay>
+            </DndContext>
           )}
         </div>
-
       </div>
 
       <AddBookmarkForm 
@@ -469,7 +538,6 @@ function App() {
         categories={CATEGORIES}
       />
 
-      {/* Delete Confirmation Modal */}
       <AnimatePresence>
         {itemToDelete && (
           <>
@@ -514,7 +582,6 @@ function App() {
         )}
       </AnimatePresence>
 
-      {/* Settings Modal */}
       <AnimatePresence>
         {isSettingsOpen && (
           <>
@@ -545,7 +612,7 @@ function App() {
                   </div>
 
                   <div className="space-y-4">
-                    {/* Install App Button - Only visible if installable */}
+                    {/* Install App Button */}
                     {installPrompt && (
                       <button
                         onClick={handleInstallClick}
@@ -561,7 +628,6 @@ function App() {
                       </button>
                     )}
 
-                    {/* Theme Toggle */}
                     <div className="flex items-center justify-between p-4 rounded-xl bg-gray-50/50 dark:bg-white/5 border border-gray-100 dark:border-white/5">
                       <span className="font-medium text-gray-700 dark:text-gray-200">Appearance</span>
                       <button
@@ -577,7 +643,6 @@ function App() {
                     <div className="space-y-3">
                       <p className="text-xs font-semibold text-gray-500 uppercase tracking-wider ml-1">Data Management</p>
                       
-                      {/* Export */}
                       <button
                         onClick={handleExportData}
                         className="w-full flex items-center gap-3 p-4 rounded-xl bg-gray-50/50 dark:bg-white/5 hover:bg-indigo-50 dark:hover:bg-indigo-900/20 border border-gray-100 dark:border-white/5 transition-colors group"
@@ -591,7 +656,6 @@ function App() {
                         </div>
                       </button>
 
-                      {/* Import */}
                       <button
                         onClick={handleImportClick}
                         className="w-full flex items-center gap-3 p-4 rounded-xl bg-gray-50/50 dark:bg-white/5 hover:bg-emerald-50 dark:hover:bg-emerald-900/20 border border-gray-100 dark:border-white/5 transition-colors group"
@@ -612,7 +676,6 @@ function App() {
                         />
                       </button>
 
-                      {/* Clear All */}
                       <button
                         onClick={handleClearAll}
                         className="w-full flex items-center gap-3 p-4 rounded-xl bg-red-50/50 dark:bg-red-900/10 hover:bg-red-100 dark:hover:bg-red-900/20 border border-red-100 dark:border-red-900/20 transition-colors group mt-4"
